@@ -1,5 +1,5 @@
 #!/bin/bash
-# BSProxy Installer
+# BSProxy Free
 REPO_URL="https://github.com/Ravenjk007/BSProxy.git"
 REPO_BRANCH="main"
 CMD_NAME="bsproxy"
@@ -73,9 +73,9 @@ else
     mkdir -p /opt/bsproxy > /dev/null 2>&1
     increment_step
 
-    show_progress "Instalando BSPro..."
+    show_progress "Instalando Rust..."
     if ! command -v rustc &> /dev/null; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y > /dev/null 2>&1 || error_exit "Falha ao instalar BSProxy"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y > /dev/null 2>&1 || error_exit "Falha ao instalar Rust"
         source "$HOME/.cargo/env"
     fi
     increment_step
@@ -106,7 +106,6 @@ else
     chmod +x /opt/bsproxy/proxy
     [ -f /opt/bsproxy/menu ] && chmod +x /opt/bsproxy/menu
 
-    # Criar o link usando cp (mais confiável)
     if [ -f /opt/bsproxy/menu ]; then
         cp /opt/bsproxy/menu /usr/local/bin/bsproxy
     else
