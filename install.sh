@@ -1,6 +1,6 @@
 #!/bin/bash
 # BSProxy Free
-REPO_URL="https://github.com/Ravenjk007/BSProxy.git"
+REPO_URL="https://github.com/PedroJbk/BSProxy.git"
 REPO_BRANCH="main"
 CMD_NAME="bsproxy"
 TOTAL_STEPS=9
