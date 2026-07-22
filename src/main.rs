@@ -80,5 +80,12 @@ fn get_port() -> u16 {
 }
 
 fn get_status() -> String {
-    env::args().nth(4).unwrap_or_else(|| "@AWPROXY".to_string())
-}
+    let status = env::args().nth(4).unwrap_or_else(|| {
+        detect_vpn_connection_status()
+    });
+    
+    if status.parse::<u16>().is_ok() && !status.contains(' ') {
+        format!("{} {}", status, get_status_text(&status))
+    } else {
+        status
+    }
