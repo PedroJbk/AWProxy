@@ -1,6 +1,6 @@
 use std::env;
 use std::io::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
@@ -50,7 +50,21 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
     }
 
     if ssh_only {
-        let _ = client_stream.write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes()).await;
+        // Aplica a lógica de Tripla Resposta mesmo em SSH Only se for HTTP
+        let mut buffer = [0u8; 1024];
+        let bytes_peeked = match timeout(Duration::from_millis(500), client_stream.peek(&mut buffer)).await {
+            Ok(Ok(n)) => n,
+            _ => 0,
+        };
+
+        if bytes_peeked > 0 {
+            let data = String::from_utf8_lossy(&buffer[..bytes_peeked]);
+            if is_http_request(&data) {
+                return websocket::handle_websocket(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
+            }
+        }
+
+        // Se não for HTTP, faz o túnel direto
         let mut server_stream = match TcpStream::connect("127.0.0.1:22").await {
             Ok(s) => s,
             Err(_) => return Ok(()),
@@ -80,12 +94,13 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
             return tls::handle_tls(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
         }
 
-        // 3. HTTP / WebSocket / Custom Methods (ACL, PATCH, etc.)
+        // 3. HTTP / WebSocket / Custom Methods
         if is_http_request(&data) {
             if data.contains("SECURITY") || data.contains("Upgrade: security") {
                 return security::handle_security(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
             }
-            return websocket::handle_websocket(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
+            // Aqui injetamos a nova lógica de Tripla Resposta
+            return websocket::handle_websocket(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
         }
     }
 
@@ -110,7 +125,7 @@ struct ProxyConfig {
 
 fn parse_args(args: &[String]) -> ProxyConfig {
     let mut port = 80u16;
-    let mut status = "@AWProxy1".to_string();
+    let mut status = "200 OK".to_string();
     let mut tls = false;
     let mut ssh_only = false;
 
