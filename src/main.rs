@@ -81,10 +81,13 @@ fn get_port() -> u16 {
 }
 
 fn get_status() -> String {
-    if let Ok(output) = Command::new("ss").args(&["-tlnp"]).output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.contains("websocket") || stdout.contains("ws") {
-            return "101".to_string(); // Switching Protocols
-        }
+    let protocol = env::args().nth(4).unwrap_or_else(|| "http".to_string());
+    let code = env::args().nth(5).unwrap_or_else(|| "200".to_string());
+    
+    match protocol.to_lowercase().as_str() {
+        "ws" | "websocket" => "101 Switching Protocols".to_string(),
+        "http/2" | "h2" => format!("HTTP/2 {} {}", code, get_status_text(&code)),
+        "http/3" | "h3" => format!("HTTP/3 {} {}", code, get_status_text(&code)),
+        _ => format!("HTTP/1.1 {} {}", code, get_status_text(&code))
     }
 }
