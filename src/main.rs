@@ -55,36 +55,26 @@ async fn start_proxy(listener: TcpListener, status: String, ssh_only: bool, use_
 async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: bool, use_tls: bool) -> Result<(), Error> {
 
     if use_tls {
-        // Modo TLS/HTTPS - usa o handler TLS
+        // Se a porta for 443 e TLS estiver habilitado, tentamos o handler TLS
         if let Err(e) = tls::handle_tls(client_stream).await {
-            eprintln!("Erro TLS: {}", e);
+            eprintln!("Erro TLS na porta 443: {}", e);
         }
         return Ok(());
     }
 
     if ssh_only {
-        // Modo SSH apenas - envia resposta HTTP e encaminha direto para SSH
-        client_stream
-            .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-            .await?;
-
+        // Modo SSH apenas - Resposta tripla para garantir compatibilidade
+        let _ = client_stream.write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes()).await;
+        
         let mut buffer = [0; 1024];
-        client_stream.read(&mut buffer).await?;
+        let _ = client_stream.read(&mut buffer).await;
 
-        client_stream
-            .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-            .await?;
+        let _ = client_stream.write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes()).await;
+        let _ = client_stream.write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes()).await;
 
-        client_stream
-            .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-            .await?;
-
-        let mut server_stream = match TcpStream::connect("0.0.0.0:22").await {
+        let mut server_stream = match TcpStream::connect("127.0.0.1:22").await {
             Ok(stream) => stream,
-            Err(_) => {
-                eprintln!("Erro ao conectar-se ao SSH");
-                return Ok(());
-            }
+            Err(_) => return Ok(()),
         };
 
         let _ = copy_bidirectional(&mut client_stream, &mut server_stream).await;
@@ -97,7 +87,6 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
         Ok(Ok(n)) => n,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
-            // Timeout - assume TCP fallback
             return tcp_fallback::handle_tcp(client_stream).await.map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::Other, "TCP fallback error")
             });
@@ -106,19 +95,18 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
 
     let data = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
 
-    // Detectar protocolo pelo primeiro byte
     if bytes_read > 0 {
         let first_byte = buffer[0];
 
         match first_byte {
-            // SOCKS5 - byte 0x05
+            // SOCKS5
             0x05 => {
                 return socks5::handle_socks5(client_stream).await.map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::Other, "SOCKS5 error")
                 });
             }
 
-            // TLS Client Hello - byte 0x16
+            // TLS Client Hello (0x16)
             0x16 => {
                 if let Err(e) = tls::handle_tls(client_stream).await {
                     eprintln!("Erro TLS handshake: {}", e);
@@ -126,38 +114,29 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
                 return Ok(());
             }
 
-            // HTTP/WebSocket - começa com GET ou CONNECT
-            _ if data.starts_with("GET") || data.starts_with("CONNECT") || data.starts_with("POST") || data.starts_with("PUT") || data.starts_with("DELETE") || data.starts_with("OPTIONS") || data.starts_with("HEAD") || data.starts_with("PATCH") => {
-                // WebSocket ou HTTP
+            // Detecção Universal de HTTP (Aceita QUALQUER método: GET, POST, ACL, PATCH, MOVE, etc.)
+            // Verificamos se contém "HTTP/" ou se começa com letras maiúsculas seguidas de espaço (padrão de métodos HTTP)
+            _ if data.contains("HTTP/") || is_http_method(&data) => {
+                // Se contiver SECURITY ou AUTH, vai para o handler de segurança
+                if data.contains("AUTH") || data.contains("SECURITY") || data.contains("Upgrade: security") {
+                    return security::handle_security(client_stream).await.map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::Other, "Security error")
+                    });
+                }
+                
+                // Caso contrário, trata como WebSocket/HTTP Injector
                 return websocket::handle_websocket(client_stream).await.map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::Other, "WebSocket error")
                 });
             }
 
-            // SECURITY - contém "AUTH" ou "SECURITY"
-            _ if data.contains("AUTH") || data.contains("SECURITY") => {
-                return security::handle_security(client_stream).await.map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "Security error")
-                });
-            }
-
-            // SSH - começa com "SSH" ou byte 0x00 seguido de "SSH"
+            // SSH Direto
             _ if data.contains("SSH") || data.contains("\x00SSH") => {
-                // Encaminhar para SSH diretamente
-                client_stream
-                    .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                client_stream.read(&mut buffer).await?;
-
-                let mut server_stream = match TcpStream::connect("0.0.0.0:22").await {
+                let _ = client_stream.write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes()).await;
+                let mut server_stream = match TcpStream::connect("127.0.0.1:22").await {
                     Ok(stream) => stream,
-                    Err(_) => {
-                        eprintln!("Erro ao conectar-se ao SSH");
-                        return Ok(());
-                    }
+                    Err(_) => return Ok(()),
                 };
-
                 let _ = copy_bidirectional(&mut client_stream, &mut server_stream).await;
                 return Ok(());
             }
@@ -166,98 +145,26 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
         }
     }
 
-    // Fallback: padrão é enviar resposta HTTP e encaminhar para SSH ou VPN
-    // Detectar se é SSH pelo conteúdo ou enviar resposta HTTP
-    if data.is_empty() {
-        // Dados vazios - assume SSH
-        client_stream
-            .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-            .await?;
-
-        client_stream.read(&mut buffer).await?;
-
-        client_stream
-            .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-            .await?;
-
-        client_stream
-            .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-            .await?;
-
-        let mut server_stream = match TcpStream::connect("0.0.0.0:22").await {
-            Ok(stream) => stream,
-            Err(_) => {
-                eprintln!("Erro ao conectar-se ao SSH");
-                return Ok(());
-            }
-        };
-
-        let _ = copy_bidirectional(&mut client_stream, &mut server_stream).await;
-    } else {
-        // Default - TCP fallback para VPN (1194) ou SSH (22)
-        match timeout(Duration::from_secs(5), peek_stream(&mut client_stream)).await {
-            Ok(Ok(peek_data)) if peek_data.contains("SSH") || peek_data.is_empty() => {
-                // SSH
-                client_stream
-                    .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                client_stream.read(&mut buffer).await?;
-
-                client_stream
-                    .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                client_stream
-                    .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                let mut server_stream = match TcpStream::connect("0.0.0.0:22").await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        eprintln!("Erro ao conectar-se ao SSH");
-                        return Ok(());
-                    }
-                };
-
-                let _ = copy_bidirectional(&mut client_stream, &mut server_stream).await;
-            }
-            _ => {
-                // VPN/OpenVPN
-                client_stream
-                    .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                client_stream.read(&mut buffer).await?;
-
-                client_stream
-                    .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                client_stream
-                    .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
-                    .await?;
-
-                let mut server_stream = match TcpStream::connect("0.0.0.0:1194").await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        eprintln!("Erro ao conectar-se ao VPN");
-                        return Ok(());
-                    }
-                };
-
-                let _ = copy_bidirectional(&mut client_stream, &mut server_stream).await;
-            }
-        }
-    }
-
-    Ok(())
+    // Fallback padrão para TCP (SSH ou VPN)
+    tcp_fallback::handle_tcp(client_stream).await.map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "TCP fallback error")
+    })
 }
 
-async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
-    let mut buffer = vec![0; 8192];
-    let bytes_peeked = stream.peek(&mut buffer).await?;
-    Ok(String::from_utf8_lossy(&buffer[..bytes_peeked]).to_string())
+// Função auxiliar para detectar se a string começa com um método HTTP válido
+fn is_http_method(data: &str) -> bool {
+    let methods = ["GET", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "HEAD", "PATCH", "TRACE", "ACL", "MOVE", "COPY", "LOCK", "UNLOCK", "PROPFIND"];
+    for method in methods.iter() {
+        if data.starts_with(method) {
+            return true;
+        }
+    }
+    // Caso seja um método desconhecido mas siga o padrão "METODO /caminho"
+    if let Some(first_space) = data.find(' ') {
+        let potential_method = &data[..first_space];
+        return potential_method.chars().all(|c| c.is_ascii_uppercase());
+    }
+    false
 }
 
 // Configuração do proxy
