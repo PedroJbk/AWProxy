@@ -80,7 +80,7 @@ fn get_port() -> u16 {
     env::args().nth(2).unwrap_or_else(|| "80".to_string()).parse().unwrap_or(80)
 }
 
-fn detect_vpn_connection_status() -> String {
+fn get_status() -> String {
     if let Ok(output) = Command::new("ss").args(&["-tlnp"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.contains("websocket") || stdout.contains("ws") {
