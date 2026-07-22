@@ -1,23 +1,33 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use anyhow::Result;
 use log::info;
 
-pub async fn handle_tcp(mut socket: TcpStream) -> Result<()> {
-    info!("📦 TCP echo");
+pub async fn handle_tcp(socket: TcpStream) -> Result<()> {
+    info!("📦 TCP fallback - encaminhando para SSH...");
     
-    let mut buf = [0u8; 1024];
-    loop {
-        match socket.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                let response = format!("TCP: {}", msg);
-                socket.write_all(response.as_bytes()).await?;
+    // Tentar SSH primeiro
+    match TcpStream::connect("127.0.0.1:22").await {
+        Ok(remote) => {
+            info!("✅ TCP fallback -> SSH conectado");
+            let _ = copy_bidirectional(&socket, &remote).await;
+            info!("🔚 Conexão TCP fallback->SSH encerrada");
+            Ok(())
+        }
+        Err(_) => {
+            // Se SSH falhar, tentar VPN
+            info!("⚠️ SSH falhou, tentando VPN...");
+            match TcpStream::connect("127.0.0.1:1194").await {
+                Ok(remote) => {
+                    info!("✅ TCP fallback -> VPN conectado");
+                    let _ = copy_bidirectional(&socket, &remote).await;
+                    Ok(())
+                }
+                Err(e) => {
+                    info!("❌ Falha TCP fallback: {}", e);
+                    Err(e.into())
+                }
             }
-            Err(e) => anyhow::bail!("TCP error: {}", e),
         }
     }
-    
-    Ok(())
 }
