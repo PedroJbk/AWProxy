@@ -31,17 +31,20 @@ async fn start_proxy(listener: TcpListener) {
 
 async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
     let status = get_status();
-    
+
+
     client_stream
         .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
         .await?;
 
     let mut buffer = [0; 1024];
     client_stream.read(&mut buffer).await?;
-    
+
+
     client_stream
         .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
         .await?;
+
 
     client_stream
         .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
@@ -77,13 +80,5 @@ fn get_port() -> u16 {
 }
 
 fn get_status() -> String {
-    let protocol = env::args().nth(4).unwrap_or_else(|| "http".to_string());
-    let code = env::args().nth(5).unwrap_or_else(|| "200".to_string());
-    
-    match protocol.to_lowercase().as_str() {
-        "ws" | "websocket" => "101 Switching Protocols".to_string(),
-        "http/2" | "h2" => format!("HTTP/2 {} {}", code, get_status_text(&code)),
-        "http/3" | "h3" => format!("HTTP/3 {} {}", code, get_status_text(&code)),
-        _ => format!("HTTP/1.1 {} {}", code, get_status_text(&code))
-    }
+    env::args().nth(4).unwrap_or_else(|| "@AWPROXY".to_string())
 }
