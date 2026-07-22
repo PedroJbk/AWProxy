@@ -8,48 +8,8 @@ pub async fn handle_security(mut socket: TcpStream, status: &str) -> Result<()> 
     info!("🔐 SECURITY handshake (Tripla Resposta)...");
 
     // ============================================================
-    // ETAPA 1: Consumir os headers da requisição ANTES de responder
-    // Para não travar a leitura, usamos um timeout curto
-    // ============================================================
-    let mut buf = vec![0u8; 4096];
-    let mut total_read = 0usize;
-    let mut consecutive_newlines = 0u32;
-
-    loop {
-        match timeout(Duration::from_millis(300), socket.read(&mut buf[total_read..])).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(n)) => {
-                total_read += n;
-                // Verificar se já lemos o fim dos headers (\r\n\r\n)
-                for i in total_read.saturating_sub(4)..total_read {
-                    if buf[i] == b'\n' {
-                        consecutive_newlines += 1;
-                        if consecutive_newlines >= 2 {
-                            break;
-                        }
-                    } else if buf[i] != b'\r' {
-                        consecutive_newlines = 0;
-                    }
-                }
-                if consecutive_newlines >= 2 {
-                    break;
-                }
-                if total_read >= 4096 {
-                    break;
-                }
-            }
-            Ok(Err(_)) => break,
-            Err(_) => break, // timeout - headers incompletos, seguir mesmo assim
-        }
-    }
-
-    if total_read > 0 {
-        let data = String::from_utf8_lossy(&buf[..total_read]);
-        debug!("📥 SECURITY Request ({} bytes): {}", total_read, data.trim());
-    }
-
-    // ============================================================
-    // ETAPA 2: Primeira Resposta - 101 Switching Protocols
+    // ETAPA 1: Primeira Resposta - 101 Switching Protocols
+    // Envia IMEDIATAMENTE sem ler nada do cliente
     // ============================================================
     let response1 = format!("HTTP/1.1 101 Switching Protocols\r\n\
                              Upgrade: security\r\n\
@@ -58,35 +18,32 @@ pub async fn handle_security(mut socket: TcpStream, status: &str) -> Result<()> 
                              \r\n", status);
     socket.write_all(response1.as_bytes()).await?;
     socket.flush().await?;
-    info!("📤 Resposta 1 enviada: 101 Switching Protocols (status: {})", status);
+    info!("📤 Resposta 1: 101 Switching Protocols (status: {})", status);
+
+    // ============================================================
+    // ETAPA 2: Leitura do payload do Injector (headers enviados)
+    // ============================================================
+    let mut buffer = [0u8; 4096];
+    let _ = timeout(Duration::from_millis(500), socket.read(&mut buffer)).await;
 
     // ============================================================
     // ETAPA 3: Segunda Resposta - 200 OK com Upgrade
-    // Pequeno delay para simular handshake real
     // ============================================================
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let response2 = format!("HTTP/1.1 200 OK\r\n\
-                             Connection: Upgrade\r\n\
-                             Upgrade: security\r\n\
-                             Status: {}\r\n\
-                             \r\n", status);
+    let response2 = "HTTP/1.1 200 OK\r\n\
+                     Connection: Upgrade\r\n\
+                     Upgrade: security\r\n\
+                     \r\n";
     socket.write_all(response2.as_bytes()).await?;
     socket.flush().await?;
-    info!("📤 Resposta 2 enviada: 200 OK (Upgrade: security, status: {})", status);
+    info!("📤 Resposta 2: 200 OK (Upgrade: security)");
 
     // ============================================================
-    // ETAPA 4: Terceira Resposta - 200 OK final com status
+    // ETAPA 4: Terceira Resposta - 200 com status
     // ============================================================
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let response3 = format!("HTTP/1.1 200 {}\r\n\
-                             Content-Type: text/plain\r\n\
-                             Connection: keep-alive\r\n\
-                             \r\n", status);
+    let response3 = format!("HTTP/1.1 200 {}\r\n\r\n", status);
     socket.write_all(response3.as_bytes()).await?;
     socket.flush().await?;
-    info!("📤 Resposta 3 enviada: 200 {} (final)", status);
+    info!("📤 Resposta 3: 200 {} (final)", status);
 
     info!("🔐 SECURITY handshake completo! (3 respostas enviadas)");
 
