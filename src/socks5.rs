@@ -5,7 +5,7 @@ use log::info;
 
 pub async fn handle_socks5(mut client: TcpStream) -> Result<()> {
     info!("🔐 SOCKS5");
-    
+
     let mut header = [0u8; 2];
     client.read_exact(&mut header).await?;
     let nmethods = header[1] as usize;
@@ -48,22 +48,14 @@ pub async fn handle_socks5(mut client: TcpStream) -> Result<()> {
         anyhow::bail!("Unsupported SOCKS command");
     }
 
-    // Normalizar endereços locais para garantir que o SOCKS5 funcione com target local
-    let final_target = if target_addr.starts_with("0.0.0.0") || target_addr.starts_with("localhost") || target_addr.starts_with("127.0.0.1") {
-        let port = target_addr.split(':').last().unwrap_or("22");
-        format!("127.0.0.1:{}", port)
-    } else {
-        target_addr.clone()
-    };
+    info!("SOCKS5 -> {}", target_addr);
 
-    info!("SOCKS5 -> {}", final_target);
-
-    match TcpStream::connect(&final_target).await {
+    match TcpStream::connect(&target_addr).await {
         Ok(remote) => {
             send_reply(&mut client, 0x00).await?;
             let (mut client_reader, mut client_writer) = client.into_split();
             let (mut remote_reader, mut remote_writer) = remote.into_split();
-            
+
             tokio::try_join!(
                 tokio::io::copy(&mut client_reader, &mut remote_writer),
                 tokio::io::copy(&mut remote_reader, &mut client_writer)
