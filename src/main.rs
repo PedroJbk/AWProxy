@@ -12,7 +12,6 @@ mod tls;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Inicializa o logger com nível INFO por padrão
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
@@ -26,8 +25,7 @@ async fn main() -> Result<(), Error> {
     let use_tls = config.tls;
     let ssh_only = config.ssh_only;
 
-    log::info!("🚀 AWProxy iniciando...");
-    log::info!("📡 Porta: {}, Status: '{}', TLS: {}, SSH-Only: {}", port, status, use_tls, ssh_only);
+    log::info!("🚀 AWProxy iniciando na porta {} | Status: '{}'", port, status);
 
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
     println!("Servidor iniciado na porta: {}", port);
@@ -41,10 +39,9 @@ async fn start_proxy(listener: TcpListener, status: String, ssh_only: bool, use_
         let status_clone = status.clone();
         match listener.accept().await {
             Ok((client_stream, addr)) => {
-                log::info!("📥 Nova conexão de: {}", addr);
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(client_stream, &status_clone, ssh_only, use_tls).await {
-                        eprintln!("❌ Erro ao processar cliente {}: {}", addr, e);
+                        eprintln!("Erro ao processar cliente {}: {}", addr, e);
                     }
                 });
             }
@@ -56,13 +53,10 @@ async fn start_proxy(listener: TcpListener, status: String, ssh_only: bool, use_
 async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: bool, use_tls: bool) -> Result<(), Error> {
 
     if use_tls {
-        log::info!("🔒 Modo TLS ativado");
         return tls::handle_tls(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
     }
 
     if ssh_only {
-        // Aplica a lógica de Tripla Resposta mesmo em SSH Only se for HTTP
-        log::info!("🔐 Modo SSH-Only ativado");
         let mut buffer = [0u8; 4096];
         let bytes_peeked = match timeout(Duration::from_millis(500), client_stream.peek(&mut buffer)).await {
             Ok(Ok(n)) => n,
@@ -73,20 +67,14 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
             let data = String::from_utf8_lossy(&buffer[..bytes_peeked]);
             let data_upper = data.to_uppercase();
 
-            // Detecção agressiva de SECURITY no modo SSH-Only
+            // Verificar SECURITY antes de tratar como HTTP normal
             if is_security_request(&data_upper) {
-                log::info!("🔍 SSH-Only: SECURITY detectado!");
+                log::info!("🔐 SECURITY detectado (SSH-Only)");
                 return security::handle_security(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
             }
 
-            if is_http_request(&data_upper) {
-                log::info!("🌐 SSH-Only: HTTP/WebSocket detectado");
+            if is_http_request(&data) {
                 return websocket::handle_websocket(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
-            }
-
-            // Se começar com SSH-
-            if data.contains("SSH-") {
-                log::info!("🔗 SSH-Only: Conexão SSH direta detectada");
             }
         }
 
@@ -111,95 +99,60 @@ async fn handle_client(mut client_stream: TcpStream, status: &str, ssh_only: boo
         let data = String::from_utf8_lossy(&buffer[..bytes_read]);
         let data_upper = data.to_uppercase();
 
-        log::debug!("🔍 Peek ({} bytes): {:?}", bytes_read, &data[..std::cmp::min(bytes_read, 300)]);
+        log::debug!("🔍 Peek ({} bytes): {:?}", bytes_read, &data[..std::cmp::min(bytes_read, 200)]);
 
         // 1. SOCKS5
         if first_byte == 0x05 {
-            log::info!("🔐 SOCKS5 detectado");
             return socks5::handle_socks5(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
         }
 
         // 2. TLS/SSL Handshake (0x16)
         if first_byte == 0x16 {
-            log::info!("🔒 TLS/SSL Handshake detectado");
             return tls::handle_tls(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
         }
 
         // 3. HTTP / WebSocket / Custom Methods
-        if is_http_request(&data_upper) {
-            log::info!("🌐 HTTP request detectado");
-
-            // === DETECÇÃO AGRESSIVA DE SECURITY ===
+        if is_http_request(&data) {
+            // === DETECÇÃO DE SECURITY ===
             if is_security_request(&data_upper) {
-                log::info!("🔐 *** MODO SECURITY ATIVADO ***");
+                log::info!("🔐 SECURITY detectado - ativando handshake");
                 return security::handle_security(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
             }
-
             // WebSocket padrão (Tripla Resposta)
-            log::info!("🌐 WebSocket Tripla Resposta");
             return websocket::handle_websocket(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
-        }
-
-        // 4. Dados não-HTTP mas com padrões especiais (ex: headers customizados)
-        if is_security_request(&data_upper) {
-            log::info!("🔐 *** MODO SECURITY ATIVADO (não-HTTP) ***");
-            return security::handle_security(client_stream, status).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
         }
     }
 
     // Fallback: TCP puro
-    log::info!("📡 Fallback para TCP puro");
     tcp_fallback::handle_tcp(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e))
 }
 
-/// Detecção ultra-agressiva de requisições SECURITY
-/// Cobre todos os cenários possíveis: method, header, valor, etc.
+/// Detecção robusta de requisições SECURITY/ACL
+/// Cobre: método SECURITY, método ACL, headers com SECURITY, padrão [SPLIT]
 fn is_security_request(data_upper: &str) -> bool {
-    // Métodos HTTP customizados
-    if data_upper.starts_with("SECURITY") ||
-       data_upper.starts_with("ACL") ||
-       data_upper.starts_with("PATCH") ||
-       data_upper.starts_with("PROPFIND") ||
-       data_upper.starts_with("PROPPATCH") ||
-       data_upper.starts_with("MKCALENDAR") ||
-       data_upper.starts_with("REPORT") {
-        return true;
-    }
-
+    // Método SECURITY
+    if data_upper.starts_with("SECURITY") { return true; }
+    // Método ACL (usado pelo HTTP Injector)
+    if data_upper.starts_with("ACL") { return true; }
+    // Método PATCH
+    if data_upper.starts_with("PATCH") { return true; }
+    // Método PROPFIND
+    if data_upper.starts_with("PROPFIND") { return true; }
     // Headers com SECURITY
-    if data_upper.contains("SECURITY") ||
-       data_upper.contains("X-SECURITY") ||
-       data_upper.contains("UPGRADE: SECURITY") ||
-       data_upper.contains("UPGRADE:SECURITY") {
-        return true;
-    }
-
-    // Headers especiais comuns em proxies HTTP
-    if data_upper.contains("X-INJECT") ||
-       data_upper.contains("X-CUSTOM") ||
-       data_upper.contains("X-PROXY") ||
-       data_upper.contains("HTTP-PROXY") ||
-       data_upper.contains("HTTP-CONNECT") {
-        return true;
-    }
-
-    // Verificar se é um método customizado (palavra maiúscula seguida de espaço e /)
-    // Ex: "ACL / HTTP/1.1" ou "SECURITY / HTTP/1.1"
-    if let Some(space_pos) = data_upper.find(' ') {
-        let method = &data_upper[..space_pos];
-        let methods_custom = ["SECURITY", "ACL", "PATCH", "PROPFIND", "PROPPATCH", "MKCALENDAR", "REPORT", "SEARCH"];
-        if methods_custom.contains(&method) {
-            return true;
-        }
-    }
+    if data_upper.contains("SECURITY") && (data_upper.contains("UPGRADE:") || data_upper.contains("X-")) { return true; }
+    // Padrão [SPLIT]ACL ou [SPLIT]SECURITY
+    if data_upper.contains("[SPLIT]ACL") || data_upper.contains("[SPLIT]SECURITY") { return true; }
+    // Upgrade: security no header
+    if data_upper.contains("UPGRADE: SECURITY") || data_upper.contains("UPGRADE:SECURITY") { return true; }
 
     false
 }
 
-fn is_http_request(data_upper: &str) -> bool {
-    let methods = ["GET", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "HEAD", "TRACE"];
+fn is_http_request(data: &str) -> bool {
+    let methods = ["GET", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "HEAD", "PATCH", "ACL", "MOVE", "PROPFIND", "SECURITY"];
+    let data_upper = data.to_uppercase();
     for m in methods {
-        if data_upper.contains(m) { return true; }
+        if data_upper.starts_with(m) || data_upper.contains(&format!("[SPLIT]{}", m)) { return true; }
     }
     data_upper.contains("HTTP/1.") || data_upper.contains("HTTP/2.")
 }
