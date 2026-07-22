@@ -32,7 +32,7 @@ show_menu() {
     show_banner
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║         AWProxy Menu Free        ║${NC}"
+    echo -e "${CYAN}║         AWProxy Proxy Free        ║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════╣${NC}"
     echo -e "${CYAN}║                                  ║${NC}"
     echo -e "${CYAN}║ ${WHITE}[01]${NC} - ABRIR PORTA               ${CYAN}║${NC}"
@@ -100,7 +100,7 @@ open_port() {
     # Perguntar Status HTTP
     read -p "Status HTTP (Padrão: @AWProxy): " STATUS
     if [[ -z "$STATUS" ]]; then
-        STATUS="@DuTra01"
+        STATUS="@AWProxy"
     fi
 
     # Perguntar SSH apenas
