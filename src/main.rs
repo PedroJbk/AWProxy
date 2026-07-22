@@ -1,86 +1,85 @@
-mod socks5;
-mod tls;
-mod websocket;
-mod tcp_fallback;
-mod security;
-
-use tokio::net::TcpListener;
-use tokio::io::AsyncReadExt;
-use clap::Parser;
-use anyhow::Result;
-use log::{info, error};
-use std::process::Command;
-
-#[derive(Parser)]
-#[command(name = "awproxy")]
-#[command(about = "Multiprotocol proxy server")]
-struct Cli {
-    #[arg(short = 'p', long = "port", default_value = "8080")]
-    port: u16,
-    #[arg(short = 'd', long = "debug")]
-    debug: bool,
-}
+use std::env;
+use std::io::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{timeout, Duration};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    
-    if cli.debug {
-        env_logger::init();
-    } else {
-        env_logger::builder()
-            .filter_level(log::LevelFilter::Info)
-            .init();
-    }
-    
-    let addr = format!("0.0.0.0:{}", cli.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("🚀 AWProxy listening on {}", addr);
-    info!("📡 Protocols: SOCKS5, TLS, WebSocket, SECURITY, TCP");
-
-    while let Ok((socket, _)) = listener.accept().await {
-        tokio::spawn(async move {
-            let mut buf = [0u8; 24];
-            match socket.peek(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    match buf[0] {
-                        0x05 => {
-                            info!("🔐 SOCKS5");
-                            let _ = socks5::handle_socks5(socket).await;
-                        }
-                        0x16 => {
-                            info!("🔒 TLS");
-                            let _ = tls::handle_tls(socket).await;
-                        }
-                        _ => {
-                            let data_str = String::from_utf8_lossy(&buf[..n]);
-                            // Verifica se é uma requisição HTTP (qualquer método)
-                            if data_str.starts_with("GET ") || 
-                               data_str.starts_with("POST ") || 
-                               data_str.starts_with("PUT ") || 
-                               data_str.starts_with("DELETE ") || 
-                               data_str.starts_with("PATCH ") || 
-                               data_str.starts_with("HEAD ") || 
-                               data_str.starts_with("CONNECT ") || 
-                               data_str.starts_with("OPTIONS ") || 
-                               data_str.starts_with("TRACE ") || 
-                               data_str.starts_with("HTTP/") {
-                                info!("🌐 WebSocket/HTTP");
-                                let _ = websocket::handle_websocket(socket).await;
-                            } else if data_str.starts_with("SECURITY") || data_str.starts_with("AUTH") {
-                                info!("🔐 SECURITY");
-                                let _ = security::handle_security(socket).await;
-                            } else {
-                                info!("📦 TCP");
-                                let _ = tcp_fallback::handle_tcp(socket).await;
-                            }
-                        }
-                    }
-                }
-                Ok(_) => info!("Connection closed"),
-                Err(e) => error!("Peek error: {}", e),
-            }
-        });
-    }
+async fn main() -> Result<(), Error> {
+    let port = get_port();
+    let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
+    println!("Servidor iniciado na porta: {}", port);
+    start_proxy(listener).await;
     Ok(())
+}
+
+async fn start_proxy(listener: TcpListener) {
+    loop {
+        match listener.accept().await {
+            Ok((client_stream, addr)) => {
+                println!("Nova conexão de: {}", addr);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(client_stream).await {
+                        eprintln!("Erro ao processar cliente {}: {}", addr, e);
+                    }
+                });
+            }
+            Err(e) => eprintln!("Erro ao aceitar conexão: {}", e),
+        }
+    }
+}
+
+async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
+    let status = get_status();
+
+    // Primeiro handshake 101
+    client_stream
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+        .await?;
+
+    let mut buffer = [0; 1024];
+    client_stream.read(&mut buffer).await?;
+
+    // Segundo handshake 101
+    client_stream
+        .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
+        .await?;
+
+    // Resposta 200 opcional
+    client_stream
+        .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
+        .await?;
+
+    let addr_proxy = match timeout(Duration::from_secs(5), peek_stream(&mut client_stream)).await {
+        Ok(Ok(data)) if data.contains("SSH") || data.is_empty() => "0.0.0.0:22",
+        Ok(_) => "0.0.0.0:1194",
+        Err(_) => "0.0.0.0:22",
+    };
+
+    let mut server_stream = match TcpStream::connect(addr_proxy).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            eprintln!("Erro ao conectar-se ao servidor proxy em {}", addr_proxy);
+            return Ok(());
+        }
+    };
+
+    // Transfere dados entre cliente e servidor com buffer dinâmico
+    let _ = copy_bidirectional(&mut client_stream, &mut server_stream).await;
+
+    Ok(())
+}
+
+async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
+    let mut buffer = vec![0; 8192];
+    let bytes_peeked = stream.peek(&mut buffer).await?;
+    Ok(String::from_utf8_lossy(&buffer[..bytes_peeked]).to_string())
+}
+
+fn get_port() -> u16 {
+    env::args().nth(2).unwrap_or_else(|| "80".to_string()).parse().unwrap_or(80)
+}
+
+fn get_status() -> String {
+    env::args().nth(4).unwrap_or_else(|| "AWPROXY".to_string())
 }
