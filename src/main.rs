@@ -80,12 +80,11 @@ fn get_port() -> u16 {
 }
 
 fn get_status() -> String {
-    let status = env::args().nth(4).unwrap_or_else(|| {
-        detect_vpn_connection_status()
-    });
+    let status = env::args().nth(4).unwrap_or_else(|| "200".to_string());
     
-    if status.parse::<u16>().is_ok() && !status.contains(' ') {
-        format!("{} {}", status, get_status_text(&status))
-    } else {
-        status
-    }
+    status
+        .split_whitespace()
+        .next()
+        .unwrap_or("200")
+        .to_string()
+}
