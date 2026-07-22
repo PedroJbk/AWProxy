@@ -15,140 +15,84 @@ mod ssh;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
-
-    let args: Vec<String> = env::args().collect();
-    let config = parse_args(&args);
-
-    let port = config.port;
-    let status = config.status.clone();
-    let use_tls = config.tls;
-
-    log::info!("AWProxy iniciando na porta {} | Status: '{}'", port, status);
-
+    // Iniciando o proxy
+    let port = get_port();
     let listener = TcpListener::bind(format!("[::]:{}", port)).await?;
-    println!("Servidor iniciado na porta: {}", port);
-
-    start_proxy(listener, status, use_tls).await;
+    println!("Iniciando servico na porta: {}", port);
+    start_http(listener).await;
     Ok(())
 }
 
-async fn start_proxy(listener: TcpListener, status: String, use_tls: bool) {
+async fn start_http(listener: TcpListener) {
     loop {
-        let status_clone = status.clone();
         match listener.accept().await {
             Ok((client_stream, addr)) => {
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(client_stream, &status_clone, use_tls).await {
-                        eprintln!("Erro ao processar cliente {}: {}", addr, e);
+                    if let Err(e) = handle_client(client_stream).await {
+                        println!("Erro ao processar cliente {}: {}", addr, e);
                     }
                 });
             }
-            Err(e) => eprintln!("Erro ao aceitar conexão: {}", e),
+            Err(e) => {
+                println!("Erro ao aceitar conexao: {}", e);
+            }
         }
     }
 }
 
-async fn handle_client(mut client_stream: TcpStream, status: &str, use_tls: bool) -> Result<(), Error> {
+async fn handle_client(mut client_stream: TcpStream) -> Result<(), Error> {
+    let status = get_status();
 
-    // Modo TLS/HTTPS: apenas passthrough (sem handshake HTTP)
-    if use_tls {
-        return tls::handle_tls(client_stream).await.map_err(|e| Error::new(std::io::ErrorKind::Other, e));
-    }
-
-    // ============================================================
-    // FLUXO BASEADO NO PADRAO DO BSProxy
-    // ============================================================
-    //
-    // O Injector envia o payload e espera 101 + 200.
-    // Depois disso, o Injector inicia SSH handshake sobre a mesma conexao.
-    // O proxy deve encaminhar os dados SSH ao servidor SSH local.
-    //
-    // CRUCIAL: O Injector envia o payload inteiro de uma vez (nao necessariamente em 2 partes).
-    // O [split] e uma diretiva do Injector, nao necessariamente do servidor.
-    // Vamos ler TODO o payload de uma vez, responder 101+200, e depois fazer tunnel.
-
-    // PASSO 1: Ler o payload completo do Injector
-    let mut payload_buf = [0u8; 8192];
-    let n = match timeout(Duration::from_millis(5000), client_stream.read(&mut payload_buf)).await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            log::warn!("Erro ao ler payload: {}", e);
-            return Ok(());
-        }
-        Err(_) => {
-            log::warn!("Timeout ao receber payload");
-            return Ok(());
-        }
-    };
-
-    let payload = String::from_utf8_lossy(&payload_buf[..n]);
-    log::info!("Payload recebido ({} bytes): {:?}", n, &payload[..std::cmp::min(n, 300)]);
-
-    // Detectar SSH vs VPN pelo payload
-    let addr_proxy = if payload.contains("SSH") || payload.contains("ssh") || payload.contains("22") {
-        "127.0.0.1:22"
-    } else {
-        "127.0.0.1:1194"
-    };
-
-    // PASSO 2: Conectar ao backend ANTES de responder ao Injector
-    log::info!("Conectando ao backend: {}", addr_proxy);
-    let server_stream = match TcpStream::connect(addr_proxy).await {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("Falha em {}: {}. Tentando fallback...", addr_proxy, e);
-            let alt = if addr_proxy == "127.0.0.1:22" { "127.0.0.1:1194" } else { "127.0.0.1:22" };
-            match TcpStream::connect(alt).await {
-                Ok(s) => {
-                    log::info!("Conectado ao fallback: {}", alt);
-                    s
-                }
-                Err(e2) => {
-                    log::error!("Ambos backends falharam: {}, {}", e, e2);
-                    return Ok(());
-                }
-            }
-        }
-    };
-
-    log::info!("Conectado ao backend: {}", addr_proxy);
-
-    // PASSO 3: Enviar 101 ao Injector
-    log::info!("Enviando 101...");
+    // SEMPRE envia 101 primeiro
     client_stream
         .write_all(format!("HTTP/1.1 101 {}\r\n\r\n", status).as_bytes())
         .await?;
-    client_stream.flush().await?;
 
-    // PASSO 4: Enviar 200 ao Injector
-    log::info!("Enviando 200...");
+    // SEMPRE le do cliente
+    let mut buffer = vec![0; 1024];
+    client_stream.read(&mut buffer).await?;
+
+    // SEMPRE envia 200
     client_stream
         .write_all(format!("HTTP/1.1 200 {}\r\n\r\n", status).as_bytes())
         .await?;
-    client_stream.flush().await?;
 
-    // PASSO 5: Agora fazer tunnel bidirecional
-    // Os dados SSH do Injector vao para o SSH server
-    // As respostas do SSH server vao para o Injector
-    let (client_r, client_w) = client_stream.into_split();
-    let (server_r, server_w) = server_stream.into_split();
+    // Detecta SSH vs VPN pelo peek
+    let mut addr_proxy = "0.0.0.0:22";
+    let result = timeout(Duration::from_secs(1), peek_stream(&mut client_stream)).await
+        .unwrap_or_else(|_| Ok(String::new()));
 
-    let client_r = Arc::new(Mutex::new(client_r));
-    let client_w = Arc::new(Mutex::new(client_w));
-    let server_r = Arc::new(Mutex::new(server_r));
-    let server_w = Arc::new(Mutex::new(server_w));
+    if let Ok(data) = result {
+        if data.contains("SSH") || data.is_empty() {
+            addr_proxy = "0.0.0.0:22";
+        } else {
+            addr_proxy = "0.0.0.0:1194";
+        }
+    } else {
+        addr_proxy = "0.0.0.0:22";
+    }
 
-    log::info!("Tunnel bidirecional iniciado");
-    tokio::try_join!(
-        transfer_data(client_r, server_w.clone()),
-        transfer_data(server_r, client_w.clone()),
-    )?;
+    let server_connect = TcpStream::connect(addr_proxy).await;
+    if server_connect.is_err() {
+        println!("erro ao iniciar conexao para o proxy ");
+        return Ok(());
+    }
 
-    log::info!("Tunnel finalizado.");
+    let server_stream = server_connect?;
+
+    let (client_read, client_write) = client_stream.into_split();
+    let (server_read, server_write) = server_stream.into_split();
+
+    let client_read = Arc::new(Mutex::new(client_read));
+    let client_write = Arc::new(Mutex::new(client_write));
+    let server_read = Arc::new(Mutex::new(server_read));
+    let server_write = Arc::new(Mutex::new(server_write));
+
+    let client_to_server = transfer_data(client_read, server_write);
+    let server_to_client = transfer_data(server_read, client_write);
+
+    tokio::try_join!(client_to_server, server_to_client)?;
+
     Ok(())
 }
 
@@ -162,35 +106,52 @@ async fn transfer_data(
             let mut read_guard = read_stream.lock().await;
             read_guard.read(&mut buffer).await?
         };
+
         if bytes_read == 0 {
             break;
         }
+
         let mut write_guard = write_stream.lock().await;
         write_guard.write_all(&buffer[..bytes_read]).await?;
     }
+
     Ok(())
 }
 
-struct ProxyConfig {
-    port: u16,
-    status: String,
-    tls: bool,
+async fn peek_stream(stream: &TcpStream) -> Result<String, Error> {
+    let mut peek_buffer = vec![0; 8192];
+    let bytes_peeked = stream.peek(&mut peek_buffer).await?;
+    let data = &peek_buffer[..bytes_peeked];
+    let data_str = String::from_utf8_lossy(data);
+    Ok(data_str.to_string())
 }
 
-fn parse_args(args: &[String]) -> ProxyConfig {
-    let mut port = 80u16;
-    let mut status = "200 OK".to_string();
-    let mut tls = false;
+fn get_port() -> u16 {
+    let args: Vec<String> = env::args().collect();
+    let mut port = 80;
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-p" => { if i+1 < args.len() { port = args[i+1].parse().unwrap_or(80); i+=1; } }
-            "-s" => { if i+1 < args.len() { status = args[i+1].clone(); i+=1; } }
-            "-t" => { tls = true; }
-            _ => {}
+    for i in 1..args.len() {
+        if args[i] == "--port" || args[i] == "-p" {
+            if i + 1 < args.len() {
+                port = args[i + 1].parse().unwrap_or(80);
+            }
         }
-        i += 1;
     }
-    ProxyConfig { port, status, tls }
+
+    port
+}
+
+fn get_status() -> String {
+    let args: Vec<String> = env::args().collect();
+    let mut status = String::from("SSHPRO");
+
+    for i in 1..args.len() {
+        if args[i] == "--status" || args[i] == "-s" {
+            if i + 1 < args.len() {
+                status = args[i + 1].clone();
+            }
+        }
+    }
+
+    status
 }
